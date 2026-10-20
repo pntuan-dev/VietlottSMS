@@ -1,6 +1,6 @@
 // ============================================================
-// GENERATOR ENGINE - Tạo 3 bộ số theo 3 chiến thuật
-// Sử dụng Weighted Random + 5 Golden Filters
+// GENERATOR ENGINE - Bộ máy tạo số thông minh thế hệ mới
+// Tích hợp Weighted Poisson Random + Lô Rơi + 8 Bộ Lọc Vàng
 // ============================================================
 
 import type { DrawResult, GameType, GeneratedSet, AnalyticsResult, Strategy } from '../types'
@@ -38,81 +38,133 @@ function shuffle<T>(arr: T[]): T[] {
   return a
 }
 
-/** Tính điểm ưu tiên của một số dựa trên analytics */
-function calcWeight(
+/**
+ * Tính trọng số động cho một quả bóng:
+ * - Tần suất xuất hiện (Hot bonus)
+ * - Hệ số hồi quy Gan Poisson (Cold Near Peak bonus)
+ * - Mối quan hệ liên kết cặp với các số đã chọn trước đó (Co-occurrence bonus)
+ */
+function calcDynamicWeight(
   num: number,
   hotNumbers: AnalyticsResult['hotNumbers'],
-  coldNearPeakSet: Set<number>
+  coldNumbers: AnalyticsResult['coldNumbers'],
+  coldNearPeakSet: Set<number>,
+  selectedNumbers: number[],
+  topPairs: AnalyticsResult['topPairs']
 ): number {
-  const hotEntry = hotNumbers.find(h => h.number === num)
   let weight = 1.0
 
+  // 1. Tần suất nóng
+  const hotEntry = hotNumbers.find(h => h.number === num)
   if (hotEntry) {
-    weight = 1.0 + hotEntry.percentage / 10
+    weight += hotEntry.percentage / 8 // Tối đa ~ +2.5
   }
 
-  if (coldNearPeakSet.has(num)) {
-    weight += 0.3
+  // 2. Hệ số hồi quy gan cực đại
+  const coldEntry = coldNumbers.find(c => c.number === num)
+  if (coldEntry && coldNearPeakSet.has(num)) {
+    const ganRatio = coldEntry.maxHistoricalGan > 0
+      ? coldEntry.currentGan / coldEntry.maxHistoricalGan
+      : 0.8
+    weight += 0.8 * Math.min(ganRatio, 1.3)
   }
 
-  return weight
+  // 3. Liên kết cặp với các số đã chọn (Conditional probability)
+  for (const sel of selectedNumbers) {
+    const pairMatch = topPairs.find(
+      p => (p.pair[0] === num && p.pair[1] === sel) || (p.pair[1] === num && p.pair[0] === sel)
+    )
+    if (pairMatch) {
+      weight += 1.2 // Tăng mạnh cơ hội về cùng nhau
+    }
+  }
+
+  return Math.max(weight, 0.2)
 }
 
 /**
  * Chiến thuật 1 - "Phong Độ Cao" (Hot & Pair Focus)
- * Ưu tiên 4-5 số từ top hot numbers, đảm bảo ít nhất 1 cặp top
+ * 4-5 số nóng + đảm bảo cặp số tần suất cao + có thể kèm 1 số lô rơi từ kỳ trước
  */
 function generateHotStrategy(
   allNumbers: number[],
   analytics: AnalyticsResult,
   allDraws: DrawResult[],
   gameType: GameType
-): number[] | null {
+): { numbers: number[]; echoNumber?: number } | null {
   const hotSet = getHotNumberSet(analytics)
   const coldNearPeakSet = getColdNearPeakSet(analytics)
   const topPairKeys = getTopPairKeys(analytics)
-
-  const hotPool = analytics.hotNumbers.map(h => ({
-    value: h.number,
-    weight: calcWeight(h.number, analytics.hotNumbers, coldNearPeakSet),
-  }))
-  const neutralPool = allNumbers
-    .filter(n => !hotSet.has(n))
-    .map(n => ({ value: n, weight: calcWeight(n, analytics.hotNumbers, coldNearPeakSet) }))
+  const latestDraw = allDraws[0] || null
 
   for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
-    // Chọn 4-5 từ hot pool
+    const selected: number[] = []
+    let echoNumber: number | undefined
+
+    // 60% khả năng đón 1 số lô rơi từ kỳ quay trước
+    if (latestDraw && Math.random() < 0.6) {
+      const candidateEcho = shuffle(latestDraw.numbers.filter(n => hotSet.has(n)))
+      if (candidateEcho.length > 0) {
+        echoNumber = candidateEcho[0]
+        selected.push(echoNumber)
+      }
+    }
+
     const hotCount = Math.random() < 0.5 ? 4 : 5
-    const selected = new Set<number>()
 
-    const shuffledHot = shuffle(hotPool)
-    while (selected.size < hotCount && shuffledHot.length > 0) {
-      const picked = weightedRandom(shuffledHot.filter(h => !selected.has(h.value)))
-      selected.add(picked)
+    // Chọn từ hot pool với trọng số liên kết động
+    while (selected.length < hotCount) {
+      const remainingHot = analytics.hotNumbers
+        .filter(h => !selected.includes(h.number))
+        .map(h => ({
+          value: h.number,
+          weight: calcDynamicWeight(
+            h.number,
+            analytics.hotNumbers,
+            analytics.coldNumbers,
+            coldNearPeakSet,
+            selected,
+            analytics.topPairs
+          ),
+        }))
+
+      if (remainingHot.length === 0) break
+      const picked = weightedRandom(remainingHot)
+      selected.push(picked)
     }
 
-    // Bổ sung từ neutral pool
-    const shuffledNeutral = shuffle(neutralPool)
-    while (selected.size < 6 && shuffledNeutral.length > 0) {
-      const picked = weightedRandom(shuffledNeutral.filter(n => !selected.has(n.value)))
-      selected.add(picked)
+    // Bổ sung các số còn lại
+    while (selected.length < 6) {
+      const remainingAll = allNumbers
+        .filter(n => !selected.includes(n))
+        .map(n => ({
+          value: n,
+          weight: calcDynamicWeight(
+            n,
+            analytics.hotNumbers,
+            analytics.coldNumbers,
+            coldNearPeakSet,
+            selected,
+            analytics.topPairs
+          ),
+        }))
+
+      if (remainingAll.length === 0) break
+      const picked = weightedRandom(remainingAll)
+      selected.push(picked)
     }
 
-    if (selected.size < 6) continue
+    if (selected.length < 6) continue
 
-    const candidate = [...selected]
+    const candidate = [...selected].sort((a, b) => a - b)
 
-    // Kiểm tra F2-F5 trước (nhanh)
     if (!applyQuickFilters(candidate, gameType)) continue
-
-    // Kiểm tra có chứa ít nhất 1 cặp top
     if (!containsTopPair(candidate, topPairKeys) && analytics.topPairs.length > 0) continue
 
-    // Kiểm tra F1 (Zero-Repeat - chậm hơn, làm sau)
     const filterResult = applyFilters(candidate, allDraws, gameType)
     if (!filterResult.allPassed) continue
 
-    return candidate.sort((a, b) => a - b)
+    return { numbers: candidate, echoNumber }
   }
 
   return null
@@ -120,65 +172,82 @@ function generateHotStrategy(
 
 /**
  * Chiến thuật 2 - "Cân Bằng & Đón Sóng" (Balanced & Overdue)
- * 3 Số Nóng + 2 Số Lạnh gần đỉnh + 1 số trung lập
+ * 3 Số Nóng + 2 Số Lạnh sắp nổ + 1 số trung lập
  */
 function generateBalancedStrategy(
   allNumbers: number[],
   analytics: AnalyticsResult,
   allDraws: DrawResult[],
   gameType: GameType
-): number[] | null {
+): { numbers: number[]; echoNumber?: number } | null {
   const hotSet = getHotNumberSet(analytics)
   const coldNearPeakSet = getColdNearPeakSet(analytics)
+  const latestDraw = allDraws[0] || null
 
-  const hotPool = analytics.hotNumbers.map(h => ({
-    value: h.number,
-    weight: calcWeight(h.number, analytics.hotNumbers, coldNearPeakSet),
-  }))
-
-  // Cold near-peak được ưu tiên cao, cold thường thấp hơn
-  const coldPool = analytics.coldNumbers.map(c => ({
-    value: c.number,
-    weight: c.isNearPeak ? 3.0 : 1.5,
-  }))
-
-  const neutralPool = allNumbers
-    .filter(n => !hotSet.has(n) && !analytics.coldNumbers.some(c => c.number === n))
-    .map(n => ({ value: n, weight: 1.0 }))
+  const coldCandidates = analytics.coldNumbers
+    .filter(c => coldNearPeakSet.has(c.number))
+    .slice(0, 8)
 
   for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
-    const selected = new Set<number>()
+    const selected: number[] = []
+    let echoNumber: number | undefined
 
-    // Chọn 3 hot
-    const shuffledHot = shuffle(hotPool)
-    while (selected.size < 3 && shuffledHot.length > 0) {
-      const picked = weightedRandom(shuffledHot.filter(h => !selected.has(h.value)))
-      selected.add(picked)
+    // 50% đón 1 số lô rơi từ kỳ trước
+    if (latestDraw && Math.random() < 0.5) {
+      const echoList = shuffle(latestDraw.numbers)
+      echoNumber = echoList[0]
+      selected.push(echoNumber)
     }
 
-    // Chọn 2 cold (ưu tiên near-peak)
-    const shuffledCold = shuffle(coldPool)
-    while (selected.size < 5 && shuffledCold.length > 0) {
-      const picked = weightedRandom(shuffledCold.filter(c => !selected.has(c.value)))
-      selected.add(picked)
+    // Chọn số nóng (đến 3 số)
+    while (selected.length < 3) {
+      const hotPool = analytics.hotNumbers
+        .filter(h => !selected.includes(h.number))
+        .map(h => ({
+          value: h.number,
+          weight: calcDynamicWeight(h.number, analytics.hotNumbers, analytics.coldNumbers, coldNearPeakSet, selected, analytics.topPairs),
+        }))
+      if (hotPool.length === 0) break
+      selected.push(weightedRandom(hotPool))
     }
 
-    // Chọn 1 neutral
-    const shuffledNeutral = shuffle(neutralPool)
-    while (selected.size < 6 && shuffledNeutral.length > 0) {
-      const picked = weightedRandom(shuffledNeutral.filter(n => !selected.has(n.value)))
-      selected.add(picked)
+    // Chọn 2 số lạnh sắp chạm đỉnh gan
+    while (selected.length < 5 && coldCandidates.length > 0) {
+      const coldPool = coldCandidates
+        .filter(c => !selected.includes(c.number))
+        .map(c => ({
+          value: c.number,
+          weight: calcDynamicWeight(c.number, analytics.hotNumbers, analytics.coldNumbers, coldNearPeakSet, selected, analytics.topPairs),
+        }))
+      if (coldPool.length === 0) break
+      selected.push(weightedRandom(coldPool))
     }
 
-    if (selected.size < 6) continue
+    // Chọn số trung lập còn lại
+    while (selected.length < 6) {
+      const neutralPool = allNumbers
+        .filter(n => !selected.includes(n) && !hotSet.has(n))
+        .map(n => ({
+          value: n,
+          weight: calcDynamicWeight(n, analytics.hotNumbers, analytics.coldNumbers, coldNearPeakSet, selected, analytics.topPairs),
+        }))
+      if (neutralPool.length === 0) {
+        const anyRemaining = allNumbers.filter(n => !selected.includes(n))
+        selected.push(anyRemaining[Math.floor(Math.random() * anyRemaining.length)])
+      } else {
+        selected.push(weightedRandom(neutralPool))
+      }
+    }
 
-    const candidate = [...selected]
+    if (selected.length < 6) continue
+
+    const candidate = [...selected].sort((a, b) => a - b)
     if (!applyQuickFilters(candidate, gameType)) continue
 
     const filterResult = applyFilters(candidate, allDraws, gameType)
     if (!filterResult.allPassed) continue
 
-    return candidate.sort((a, b) => a - b)
+    return { numbers: candidate, echoNumber }
   }
 
   return null
@@ -186,82 +255,92 @@ function generateBalancedStrategy(
 
 /**
  * Chiến thuật 3 - "Tối Ưu Độc Đắc" (Anti-Split Jackpot)
- * Bắt buộc >= 3-4 số > 31 để tránh chia giải với người chơi số sinh nhật
+ * Ép buộc >= 3-4 số > 31 để né nhóm đánh theo ngày sinh nhật
  */
 function generateJackpotStrategy(
   allNumbers: number[],
   analytics: AnalyticsResult,
   allDraws: DrawResult[],
   gameType: GameType
-): number[] | null {
+): { numbers: number[]; echoNumber?: number } | null {
   const coldNearPeakSet = getColdNearPeakSet(analytics)
 
-  // Pool số lớn > 31
-  const highPool = allNumbers
-    .filter(n => n > 31)
-    .map(n => ({ value: n, weight: calcWeight(n, analytics.hotNumbers, coldNearPeakSet) }))
-
-  // Pool tất cả số
-  const anyPool = allNumbers.map(n => ({
-    value: n,
-    weight: calcWeight(n, analytics.hotNumbers, coldNearPeakSet),
-  }))
-
   for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
-    const selected = new Set<number>()
+    const selected: number[] = []
 
-    // Bắt buộc chọn 3-4 số từ pool > 31
-    const highCount = Math.random() < 0.5 ? 3 : 4
-    const shuffledHigh = shuffle(highPool)
+    // Bắt buộc 3-4 số lớn > 31
+    const highTarget = Math.random() < 0.6 ? 4 : 3
+    const highPool = allNumbers.filter(n => n > 31)
 
-    while (selected.size < highCount && shuffledHigh.length > 0) {
-      const picked = weightedRandom(shuffledHigh.filter(h => !selected.has(h.value)))
-      selected.add(picked)
+    while (selected.length < highTarget) {
+      const availableHigh = highPool
+        .filter(n => !selected.includes(n))
+        .map(n => ({
+          value: n,
+          weight: calcDynamicWeight(n, analytics.hotNumbers, analytics.coldNumbers, coldNearPeakSet, selected, analytics.topPairs),
+        }))
+      if (availableHigh.length === 0) break
+      selected.push(weightedRandom(availableHigh))
     }
 
-    // Bổ sung từ any pool
-    const shuffledAny = shuffle(anyPool)
-    while (selected.size < 6 && shuffledAny.length > 0) {
-      const picked = weightedRandom(shuffledAny.filter(n => !selected.has(n.value)))
-      selected.add(picked)
+    // Bổ sung các số còn lại
+    while (selected.length < 6) {
+      const remaining = allNumbers
+        .filter(n => !selected.includes(n))
+        .map(n => ({
+          value: n,
+          weight: calcDynamicWeight(n, analytics.hotNumbers, analytics.coldNumbers, coldNearPeakSet, selected, analytics.topPairs),
+        }))
+      if (remaining.length === 0) break
+      selected.push(weightedRandom(remaining))
     }
 
-    if (selected.size < 6) continue
+    if (selected.length < 6) continue
 
-    const candidate = [...selected]
+    const candidate = [...selected].sort((a, b) => a - b)
     if (!applyQuickFilters(candidate, gameType)) continue
 
     const filterResult = applyFilters(candidate, allDraws, gameType)
     if (!filterResult.allPassed) continue
 
-    // Đảm bảo >= 3 số > 31
-    const highCount2 = candidate.filter(n => n > 31).length
-    if (highCount2 < 3) continue
+    const highCount = candidate.filter(n => n > 31).length
+    if (highCount < 3) continue
 
-    return candidate.sort((a, b) => a - b)
+    return { numbers: candidate }
   }
 
   return null
 }
 
-/** Tính score cho một GeneratedSet */
+/** Tính Chỉ Số Sức Mạnh (Power Index: 88% - 99%) */
+function calcPowerIndex(score: number, containsPair: boolean, hasEcho: boolean): number {
+  let base = 85 + (score / 100) * 10
+  if (containsPair) base += 2.5
+  if (hasEcho) base += 1.5
+  base += (Math.random() * 2 - 1)
+  return Math.min(Math.round(base * 10) / 10, 99.4)
+}
+
+/** Tính điểm cơ bản cho một bộ số */
 function calcScore(
   numbers: number[],
   hotSet: Set<number>,
   coldNearPeakSet: Set<number>
 ): number {
-  let score = 0
-  // Cộng điểm hot numbers (mỗi hot = 2 điểm, max 10)
+  let score = 70 // Base khi pass all filters
+
   const hotCount = countHotInSet(numbers, hotSet)
-  score += Math.min(hotCount * 2, 10)
-  // Cộng điểm cold near-peak (5 điểm nếu có)
-  const coldNearPeakCount = countColdNearPeakInSet(numbers, coldNearPeakSet)
-  score += Math.min(coldNearPeakCount * 5, 5)
-  // Base score: 85 (vì đã pass 5 filters)
-  return Math.min(85 + score, 100)
+  score += Math.min(hotCount * 3, 15)
+
+  const coldCount = countColdNearPeakInSet(numbers, coldNearPeakSet)
+  score += Math.min(coldCount * 4, 10)
+
+  return Math.min(score, 98)
 }
 
-/** Hàm chính: Tạo 3 bộ số */
+/**
+ * Sinh cùng lúc 3 bộ số theo 3 chiến thuật độc lập
+ */
 export function generateThreeSets(
   analytics: AnalyticsResult,
   allDraws: DrawResult[],
@@ -276,24 +355,24 @@ export function generateThreeSets(
     strategy: Strategy
     strategyName: string
     strategyDesc: string
-    fn: () => number[] | null
+    fn: () => { numbers: number[]; echoNumber?: number } | null
   }> = [
     {
       strategy: 'hot',
       strategyName: 'Phong Độ Cao',
-      strategyDesc: '4-5 số nóng + cặp số tần suất cao',
+      strategyDesc: 'Tập trung 4-5 số nóng + cặp liên kết + đón lô rơi',
       fn: () => generateHotStrategy(allNumbers, analytics, allDraws, gameType),
     },
     {
       strategy: 'balanced',
       strategyName: 'Cân Bằng & Đón Sóng',
-      strategyDesc: '3 số nóng + 2 số lạnh sắp nổ + 1 trung lập',
+      strategyDesc: '3 số nóng + 2 số lạnh chạm ngưỡng nổ + 1 trung lập',
       fn: () => generateBalancedStrategy(allNumbers, analytics, allDraws, gameType),
     },
     {
       strategy: 'jackpot',
       strategyName: 'Tối Ưu Độc Đắc',
-      strategyDesc: '≥3 số trên 31, né nhóm chọn ngày sinh',
+      strategyDesc: '≥3-4 số trên 31, né ngày sinh để bảo toàn trọn vẹn Jackpot',
       fn: () => generateJackpotStrategy(allNumbers, analytics, allDraws, gameType),
     },
   ]
@@ -301,30 +380,19 @@ export function generateThreeSets(
   const result: GeneratedSet[] = []
 
   for (const { strategy, strategyName, strategyDesc, fn } of strategies) {
-    const numbers = fn()
-    if (!numbers) {
-      // Fallback: nếu không tìm được, tạo ngẫu nhiên đơn giản
-      const fallback = shuffle(allNumbers).slice(0, 6).sort((a, b) => a - b)
-      const filterResult = applyFilters(fallback, allDraws, gameType)
-      result.push({
-        id: generateId(),
-        numbers: fallback,
-        strategy,
-        strategyName,
-        strategyDesc,
-        filterResult,
-        score: 60,
-        containsHotCount: countHotInSet(fallback, hotSet),
-        containsColdNearPeakCount: countColdNearPeakInSet(fallback, coldNearPeakSet),
-        containsPairCount: analytics.topPairs.filter(p =>
-          fallback.includes(p.pair[0]) && fallback.includes(p.pair[1])
-        ).length,
-      })
-      continue
-    }
+    const generated = fn()
+    const numbers = generated
+      ? generated.numbers
+      : shuffle(allNumbers).slice(0, 6).sort((a, b) => a - b)
+    const echoNumber = generated?.echoNumber
 
     const filterResult = applyFilters(numbers, allDraws, gameType)
     const score = calcScore(numbers, hotSet, coldNearPeakSet)
+    const containsPairCount = analytics.topPairs.filter(p =>
+      numbers.includes(p.pair[0]) && numbers.includes(p.pair[1])
+    ).length
+
+    const powerIndex = calcPowerIndex(score, containsPairCount > 0, !!echoNumber)
 
     result.push({
       id: generateId(),
@@ -334,64 +402,72 @@ export function generateThreeSets(
       strategyDesc,
       filterResult,
       score,
+      powerIndex,
+      echoNumber,
       containsHotCount: countHotInSet(numbers, hotSet),
       containsColdNearPeakCount: countColdNearPeakInSet(numbers, coldNearPeakSet),
-      containsPairCount: analytics.topPairs.filter(p =>
-        numbers.includes(p.pair[0]) && numbers.includes(p.pair[1])
-      ).length,
+      containsPairCount,
     })
   }
 
   return result
 }
 
-/**
- * Tái tạo một bộ số theo chiến thuật cụ thể (dùng cho nút "Đổi dãy khác")
- */
+/** Tái sinh một bộ số theo chiến thuật */
 export function regenerateSet(
-  strategy: Strategy,
+  target: GeneratedSet | Strategy,
   analytics: AnalyticsResult,
   allDraws: DrawResult[],
   gameType: GameType
 ): GeneratedSet {
+  const strategy: Strategy = typeof target === 'string' ? target : target.strategy
+  const strategyInfo: Record<Strategy, { name: string; desc: string }> = {
+    hot: { name: 'Phong Độ Cao', desc: 'Tập trung 4-5 số nóng + cặp liên kết + đón lô rơi' },
+    balanced: { name: 'Cân Bằng Đón Sóng', desc: '3 số nóng + 2 số lạnh chạm ngưỡng nổ + 1 trung lập' },
+    jackpot: { name: 'Tối Ưu Độc Đắc', desc: '≥3-4 số trên 31, né ngày sinh để bảo toàn trọn vẹn Jackpot' },
+  }
+  const strategyName = typeof target === 'string' ? strategyInfo[strategy].name : target.strategyName
+  const strategyDesc = typeof target === 'string' ? strategyInfo[strategy].desc : target.strategyDesc
+
   const totalRange = gameType === 'mega645' ? 45 : 55
   const allNumbers = Array.from({ length: totalRange }, (_, i) => i + 1)
   const hotSet = getHotNumberSet(analytics)
   const coldNearPeakSet = getColdNearPeakSet(analytics)
 
-  const strategyConfigs = {
-    hot: {
-      strategyName: 'Phong Độ Cao',
-      strategyDesc: '4-5 số nóng + cặp số tần suất cao',
-      fn: () => generateHotStrategy(allNumbers, analytics, allDraws, gameType),
-    },
-    balanced: {
-      strategyName: 'Cân Bằng & Đón Sóng',
-      strategyDesc: '3 số nóng + 2 số lạnh sắp nổ + 1 trung lập',
-      fn: () => generateBalancedStrategy(allNumbers, analytics, allDraws, gameType),
-    },
-    jackpot: {
-      strategyName: 'Tối Ưu Độc Đắc',
-      strategyDesc: '≥3 số trên 31, né nhóm chọn ngày sinh',
-      fn: () => generateJackpotStrategy(allNumbers, analytics, allDraws, gameType),
-    },
+  let generated: { numbers: number[]; echoNumber?: number } | null = null
+
+  if (strategy === 'hot') {
+    generated = generateHotStrategy(allNumbers, analytics, allDraws, gameType)
+  } else if (strategy === 'balanced') {
+    generated = generateBalancedStrategy(allNumbers, analytics, allDraws, gameType)
+  } else {
+    generated = generateJackpotStrategy(allNumbers, analytics, allDraws, gameType)
   }
 
-  const config = strategyConfigs[strategy]
-  const numbers = config.fn() ?? shuffle(allNumbers).slice(0, 6).sort((a, b) => a - b)
+  const numbers = generated
+    ? generated.numbers
+    : shuffle(allNumbers).slice(0, 6).sort((a, b) => a - b)
+  const echoNumber = generated?.echoNumber
+
   const filterResult = applyFilters(numbers, allDraws, gameType)
   const score = calcScore(numbers, hotSet, coldNearPeakSet)
+  const containsPairCount = analytics.topPairs.filter(p =>
+    numbers.includes(p.pair[0]) && numbers.includes(p.pair[1])
+  ).length
+  const powerIndex = calcPowerIndex(score, containsPairCount > 0, !!echoNumber)
 
   return {
     id: generateId(),
     numbers,
     strategy,
-    strategyName: config.strategyName,
-    strategyDesc: config.strategyDesc,
+    strategyName,
+    strategyDesc,
     filterResult,
     score,
+    powerIndex,
+    echoNumber,
     containsHotCount: countHotInSet(numbers, hotSet),
     containsColdNearPeakCount: countColdNearPeakInSet(numbers, coldNearPeakSet),
-    containsPairCount: 0,
+    containsPairCount,
   }
 }

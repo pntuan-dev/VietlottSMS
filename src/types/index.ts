@@ -53,19 +53,23 @@ export interface AnalyticsResult {
   timeframeDraws: number
 }
 
-/** Trạng thái vượt qua 5 bộ lọc vàng */
+/** Trạng thái vượt qua các bộ lọc vàng */
 export interface FilterResult {
   zeroRepeat: boolean
   evenOdd: boolean
   highLow: boolean
   bellCurveSum: boolean
   consecutive: boolean
+  decadeSpread?: boolean
+  spanSpread?: boolean
+  lastDigitLimit?: boolean
   allPassed: boolean
   sum: number
   evenCount: number
   oddCount: number
   highCount: number
   lowCount: number
+  span?: number
 }
 
 /** Một bộ số được tạo ra */
@@ -77,6 +81,8 @@ export interface GeneratedSet {
   strategyDesc: string
   filterResult: FilterResult
   score: number
+  powerIndex?: number
+  echoNumber?: number
   containsHotCount: number
   containsColdNearPeakCount: number
   containsPairCount: number
